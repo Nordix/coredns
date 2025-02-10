@@ -3,14 +3,18 @@ package metrics
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/pkg/reuseport"
+	"golang.org/x/net/http2"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -97,12 +101,45 @@ func (m *Metrics) OnStartup() error {
 	m.mux = http.NewServeMux()
 	m.mux.Handle("/metrics", promhttp.HandlerFor(m.Reg, promhttp.HandlerOpts{}))
 
+	// Read server certificate and private key.
+	cert, err := tls.LoadX509KeyPair("certs/server.pem", "certs/server-key.pem")
+	if err != nil {
+		log.Errorf("Error loading server certificate: %s", err)
+		return nil
+	}
+
+	// Read CA certificate and create cert pool for client authentication.
+	caCert, err := os.ReadFile("certs/client-ca.pem")
+	if err != nil {
+		log.Errorf("Error loading client CA certificate: %s", err)
+		return nil
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+	// TLS configuration
+	tlsConfig := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		ClientAuth:         tls.RequireAndVerifyClientCert,
+		ClientCAs:          caCertPool,
+		MinVersion:         tls.VersionTLS13,
+		NextProtos:         []string{http2.NextProtoTLS},
+		InsecureSkipVerify: false, // Do not skip verification (default behavior)
+	}
+
 	// creating some helper variables to avoid data races on m.srv and m.ln
-	server := &http.Server{Handler: m.mux}
+	server := &http.Server{
+		Handler:   m.mux,
+		TLSConfig: tlsConfig,
+	}
 	m.srv = server
 
 	go func() {
-		server.Serve(ln)
+		// Start the server with TLS (HTTPS)
+		err := server.ListenAndServeTLS("", "")
+		if err != nil {
+			log.Fatalf("Failed to start server: %v", err)
+		}
 	}()
 
 	ListenAddr = ln.Addr().String() // For tests.
@@ -125,7 +162,7 @@ func (m *Metrics) stopServer() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := m.srv.Shutdown(ctx); err != nil {
-		log.Infof("Failed to stop prometheus http server: %s", err)
+		log.Infof("Failed to stop prometheus https server: %s", err)
 		return err
 	}
 	m.lnSetup = false
