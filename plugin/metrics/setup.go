@@ -1,12 +1,8 @@
 package metrics
 
 import (
-	"crypto/tls"
-	"fmt"
 	"net"
 	"runtime"
-
-	"strings"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
@@ -111,8 +107,8 @@ func parse(c *caddy.Controller) (*Metrics, error) {
 				}
 				tlsCfg := &tlsConfig{
 					enabled:        true,
-					minVersion:     tls.VersionTLS13,
-					clientAuthType: tls.RequireAndVerifyClientCert,
+					clientAuthType: "RequestClientCert",
+					cancelFunc:     func() {}, // Initialize with no-op function
 				}
 
 				// Get cert and key files as positional arguments
@@ -131,24 +127,17 @@ func parse(c *caddy.Controller) (*Metrics, error) {
 							return nil, c.ArgErr()
 						}
 						tlsCfg.clientCAFile = c.Val()
-					case "min_version":
-						if !c.NextArg() {
-							return nil, c.ArgErr()
-						}
-						ver, err := parseTLSVersion(c.Val())
-						if err != nil {
-							return nil, c.Err(err.Error())
-						}
-						tlsCfg.minVersion = ver
 					case "client_auth":
 						if !c.NextArg() {
 							return nil, c.ArgErr()
 						}
-						authType, err := parseClientAuthType(c.Val())
-						if err != nil {
-							return nil, c.Err(err.Error())
+						// Validate client auth type
+						switch c.Val() {
+						case "RequestClientCert", "RequireAnyClientCert", "VerifyClientCertIfGiven", "RequireAndVerifyClientCert", "NoClientCert":
+							tlsCfg.clientAuthType = c.Val()
+						default:
+							return nil, c.Errf("invalid client auth type: %s", c.Val())
 						}
-						tlsCfg.clientAuthType = authType
 					default:
 						return nil, c.Errf("unknown tls option: %s", c.Val())
 					}
@@ -163,38 +152,6 @@ func parse(c *caddy.Controller) (*Metrics, error) {
 		return nil, err
 	}
 	return met, nil
-}
-
-func parseTLSVersion(version string) (uint16, error) {
-	switch version {
-	case "1.3":
-		return tls.VersionTLS13, nil
-	case "1.2":
-		return tls.VersionTLS12, nil
-	case "1.1":
-		return tls.VersionTLS11, nil
-	case "1.0":
-		return tls.VersionTLS10, nil
-	default:
-		return 0, fmt.Errorf("unsupported TLS version: %s", version)
-	}
-}
-
-func parseClientAuthType(authType string) (tls.ClientAuthType, error) {
-	switch strings.ToLower(authType) {
-	case "none":
-		return tls.NoClientCert, nil
-	case "request":
-		return tls.RequestClientCert, nil
-	case "require":
-		return tls.RequireAnyClientCert, nil
-	case "verify":
-		return tls.VerifyClientCertIfGiven, nil
-	case "require_and_verify":
-		return tls.RequireAndVerifyClientCert, nil
-	default:
-		return 0, fmt.Errorf("unsupported client auth type: %s", authType)
-	}
 }
 
 // defaultAddr is the address the where the metrics are exported by default.

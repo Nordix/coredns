@@ -3,9 +3,8 @@ package metrics
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -19,7 +18,91 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/prometheus/exporter-toolkit/web"
 )
+
+// logAdapter adapts our existing logging to the slog.Logger interface
+type logAdapter struct{}
+
+func (l *logAdapter) Info(msg string, args ...any) {
+	log.Infof(msg, args...)
+}
+
+func (l *logAdapter) Error(msg string, args ...any) {
+	log.Errorf(msg, args...)
+}
+
+func (l *logAdapter) Debug(msg string, args ...any) {
+	log.Debugf(msg, args...)
+}
+
+func (l *logAdapter) Warn(msg string, args ...any) {
+	log.Warningf(msg, args...)
+}
+
+func (l *logAdapter) With(args ...any) *slog.Logger {
+	return slog.Default()
+}
+
+func (l *logAdapter) WithGroup(name string) slog.Handler {
+	// Since our logging system doesn't support groups, we'll just return the same handler
+	return l
+}
+
+func (l *logAdapter) Log(ctx context.Context, level slog.Level, msg string, args ...any) {
+	switch level {
+	case slog.LevelDebug:
+		l.Debug(msg, args...)
+	case slog.LevelInfo:
+		l.Info(msg, args...)
+	case slog.LevelWarn:
+		l.Warn(msg, args...)
+	case slog.LevelError:
+		l.Error(msg, args...)
+	}
+}
+
+func (l *logAdapter) Enabled(ctx context.Context, level slog.Level) bool {
+	// We'll consider all levels enabled since we want to pass through all logs
+	return true
+}
+
+func (l *logAdapter) Handle(ctx context.Context, r slog.Record) error {
+	// Convert the record to our logging format
+	msg := r.Message
+	args := make([]interface{}, 0, r.NumAttrs())
+	r.Attrs(func(attr slog.Attr) bool {
+		args = append(args, attr.Key, attr.Value)
+		return true
+	})
+
+	switch r.Level {
+	case slog.LevelDebug:
+		l.Debug(msg, args...)
+	case slog.LevelInfo:
+		l.Info(msg, args...)
+	case slog.LevelWarn:
+		l.Warn(msg, args...)
+	case slog.LevelError:
+		l.Error(msg, args...)
+	}
+	return nil
+}
+
+func (l *logAdapter) WithAttrs(attrs []slog.Attr) slog.Handler {
+	// Create a new adapter with the additional attributes
+	// Since our logging system doesn't support structured logging, we'll just return the same handler
+	return l
+}
+
+func (l *logAdapter) Handler() slog.Handler {
+	return l
+}
+
+func newLoggerAdapter() *slog.Logger {
+	return slog.New(&logAdapter{})
+}
 
 // Metrics holds the prometheus configuration. The metrics' path is fixed to be /metrics .
 type Metrics struct {
@@ -62,20 +145,19 @@ type tlsConfig struct {
 	// Can contain multiple CA certificates in a single PEM file
 	clientCAFile string
 
-	// minVersion is the minimum TLS version to accept
-	// Optional: Defaults to tls.VersionTLS13
-	// Possible values: tls.VersionTLS10 through tls.VersionTLS13
-	minVersion uint16
-
 	// clientAuthType controls how client certificates are handled
-	// Optional: Defaults to tls.RequireAndVerifyClientCert (strictest)
+	// Optional: Defaults to "RequestClientCert" (strictest)
 	// Possible values:
-	//   - tls.NoClientCert: No client cert required
-	//   - tls.RequestClientCert: Request but don't require
-	//   - tls.RequireAnyClientCert: Require any valid cert
-	//   - tls.VerifyClientCertIfGiven: Verify if provided
-	//   - tls.RequireAndVerifyClientCert: Require and verify
-	clientAuthType tls.ClientAuthType
+	//   - "RequestClientCert"
+	//   - "RequireAnyClientCert"
+	//   - "VerifyClientCertIfGiven"
+	//   - "RequireAndVerifyClientCert"
+	//   - "NoClientCert"
+	clientAuthType string
+
+	// cancelFunc is the function that can be used to dismantle the
+	// TLS server
+	cancelFunc context.CancelFunc
 }
 
 // New returns a new instance of Metrics with the given address.
@@ -148,6 +230,10 @@ func (m *Metrics) validate() error {
 
 // OnStartup sets up the metrics on startup.
 func (m *Metrics) OnStartup() error {
+	if err := m.validate(); err != nil {
+		return err
+	}
+
 	ln, err := reuseport.Listen("tcp", m.Addr)
 	if err != nil {
 		log.Errorf("Failed to start metrics handler: %s", err)
@@ -160,51 +246,74 @@ func (m *Metrics) OnStartup() error {
 	m.mux = http.NewServeMux()
 	m.mux.Handle("/metrics", promhttp.HandlerFor(m.Reg, promhttp.HandlerOpts{}))
 
-	// Create server with or without TLS based on configuration
-	server := &http.Server{Handler: m.mux}
+	server := &http.Server{
+		Addr:    m.Addr,
+		Handler: m.mux,
+	}
+	// Create server without TLS based on configuration
+	tlsEnabled := m.tlsConfig != nil && m.tlsConfig.enabled
 	m.srv = server
 
-	if m.tlsConfig != nil && m.tlsConfig.enabled {
-		// Load server certificate
-		cert, err := tls.LoadX509KeyPair(m.tlsConfig.certFile, m.tlsConfig.keyFile)
-		if err != nil {
-			return fmt.Errorf("failed to load server certificate: %v", err)
-		}
-
-		// Configure TLS
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   m.tlsConfig.minVersion,
-			ClientAuth:   m.tlsConfig.clientAuthType,
-		}
-
-		// Load client CA if specified
-		if m.tlsConfig.clientCAFile != "" {
-			caCert, err := os.ReadFile(m.tlsConfig.clientCAFile)
-			if err != nil {
-				return fmt.Errorf("failed to read client CA certificate: %v", err)
-			}
-			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(caCert)
-			tlsConfig.ClientCAs = caCertPool
-		}
-
-		server.TLSConfig = tlsConfig
-	}
-
-	go func() {
-		if m.tlsConfig != nil && m.tlsConfig.enabled {
-			// Start HTTPS server
-			if err := server.ServeTLS(ln, "", ""); err != nil && err != http.ErrServerClosed {
-				log.Errorf("Failed to start HTTPS metrics server: %s", err)
-			}
-		} else {
-			// Start HTTP server
+	if !tlsEnabled {
+		go func() {
 			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				log.Errorf("Failed to start HTTP metrics server: %s", err)
 			}
+		}()
+		ListenAddr = ln.Addr().String() // For tests.
+		return nil
+	}
+
+	// Create web config for ListenAndServe
+	webConfig := &web.FlagConfig{
+		WebListenAddresses: &[]string{m.Addr},
+		WebSystemdSocket:   new(bool), // false by default
+		WebConfigFile:      new(string),
+	}
+
+	// Create temporary YAML config file for TLS settings
+	// tmpDir := os.TempDir()
+	tmpFile, err := os.CreateTemp("/dev/shm", "metrics-tls-config-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary TLS config file: %w", err)
+	}
+
+	// Handle case when clientAuthType is not set
+	if m.tlsConfig.clientAuthType == "" {
+		m.tlsConfig.clientAuthType = "RequestClientCert"
+	}
+
+	yamlConfig := fmt.Sprintf(`
+tls_server_config:
+  cert_file: %s
+  key_file: %s
+  client_ca_file: %s
+  client_auth_type: %s
+`, m.tlsConfig.certFile, m.tlsConfig.keyFile, m.tlsConfig.clientCAFile, m.tlsConfig.clientAuthType)
+
+	if _, err := tmpFile.WriteString(yamlConfig); err != nil {
+		return fmt.Errorf("failed to write TLS config to temporary file: %w", err)
+	}
+
+	*webConfig.WebConfigFile = tmpFile.Name()
+
+	// Create logger
+	logger := newLoggerAdapter()
+
+	// Create context with cancel function for server shutdown
+	_, cancel := context.WithCancel(context.Background())
+	m.tlsConfig.cancelFunc = cancel
+
+	// Start the server
+	go func() {
+		err := web.Serve(m.ln, server, webConfig, logger)
+		if err != nil && err != http.ErrServerClosed {
+			log.Errorf("Failed to start HTTPS metrics server: %v", err)
 		}
 	}()
+
+	// Give the server a moment to start
+	time.Sleep(100 * time.Millisecond)
 
 	ListenAddr = ln.Addr().String() // For tests.
 	return nil
@@ -223,11 +332,16 @@ func (m *Metrics) stopServer() error {
 	if !m.lnSetup {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := m.srv.Shutdown(ctx); err != nil {
-		log.Infof("Failed to stop prometheus http server: %s", err)
-		return err
+	// In tls case, just running the cancelFunc will signal shutdown
+	if m.tlsConfig != nil && m.tlsConfig.cancelFunc != nil {
+		m.tlsConfig.cancelFunc()
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := m.srv.Shutdown(ctx); err != nil {
+			log.Infof("Failed to stop prometheus http server: %s", err)
+			return err
+		}
 	}
 	m.lnSetup = false
 	m.ln.Close()
