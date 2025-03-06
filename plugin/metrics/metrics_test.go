@@ -188,7 +188,7 @@ func TestMetricsTLS(t *testing.T) {
 				certFile:       certFile,
 				keyFile:        keyFile,
 				clientCAFile:   caFile,
-				clientAuthType: tls.RequireAndVerifyClientCert,
+				clientAuthType: "RequireAndVerifyClientCert",
 			},
 			expectError: false,
 			expectHTTPS: true,
