@@ -263,6 +263,14 @@ func (m *Metrics) OnStartup() error {
 		return nil
 	}
 
+
+	// Create web config for ListenAndServe
+	webConfig := &web.FlagConfig{
+		WebListenAddresses: &[]string{m.Addr},
+		WebSystemdSocket:   new(bool), // false by default
+		WebConfigFile:      new(string),
+	}
+
 	// Create temporary YAML config file for TLS settings
 	tmpFile, err := os.CreateTemp("", "metrics-tls-config-*.yaml")
 	if err != nil {
@@ -274,30 +282,23 @@ func (m *Metrics) OnStartup() error {
 tls_server_config:
   cert_file: %s
   key_file: %s
+  client_ca_file: %s
   client_auth_type: %s
   min_version: %d
-`, m.tlsConfig.certFile, m.tlsConfig.keyFile, m.tlsConfig.clientAuthType, web.TLSVersion(m.tlsConfig.minVersion))
+`, m.tlsConfig.certFile, m.tlsConfig.keyFile, m.tlsConfig.clientCAFile, m.tlsConfig.clientAuthType, m.tlsConfig.minVersion)
 
 	if _, err := tmpFile.WriteString(yamlConfig); err != nil {
 		return fmt.Errorf("failed to write TLS config to temporary file: %w", err)
 	}
 
-	configFile := tmpFile.Name()
-	config := &web.FlagConfig{
-		WebListenAddresses: &[]string{m.Addr},
-		WebSystemdSocket:   new(bool), // false by default
-		WebConfigFile:      &configFile,
-	}
-
-	_, cancel := context.WithCancel(context.Background())
-	m.tlsConfig.cancelFunc = cancel
+	*webConfig.WebConfigFile = tmpFile.Name()
 
 	// Create logger
 	logger := newLoggerAdapter()
 
 	// Create the server
 	go func() {
-		if err := web.ListenAndServe(server, config, logger); err != nil && err != http.ErrServerClosed {
+		if err := web.ListenAndServe(server, webConfig, logger); err != nil && err != http.ErrServerClosed {
 			log.Errorf("Failed to start HTTPS metrics server: %s", err)
 		}
 	}()

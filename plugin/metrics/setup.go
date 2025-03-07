@@ -138,12 +138,24 @@ func parse(c *caddy.Controller) (*Metrics, error) {
 						if err != nil {
 							return nil, c.Err(err.Error())
 						}
-						tlsCfg.minVersion = uint16(ver)
+						// Validate TLS version
+						switch ver {
+						case tls.VersionTLS10, tls.VersionTLS11, tls.VersionTLS12, tls.VersionTLS13:
+							tlsCfg.minVersion = uint16(ver)
+						default:
+							return nil, c.Errf("invalid TLS version: %d", ver)
+						}
 					case "client_auth":
 						if !c.NextArg() {
 							return nil, c.ArgErr()
 						}
-						tlsCfg.clientAuthType = c.Val()
+						// Validate client auth type
+						switch c.Val() {
+						case "RequestClientCert", "RequireAnyClientCert", "VerifyClientCertIfGiven", "RequireAndVerifyClientCert", "NoClientCert":
+							tlsCfg.clientAuthType = c.Val()
+						default:
+							return nil, c.Errf("invalid client auth type: %s", c.Val())
+						}
 					default:
 						return nil, c.Errf("unknown tls option: %s", c.Val())
 					}
