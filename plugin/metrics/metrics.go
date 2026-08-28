@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"net/http"
@@ -39,7 +40,10 @@ type Metrics struct {
 
 	plugins map[string]struct{} // all available plugins, used to determine which plugin made the client write
 
+	// tlsConfigPath points to an exporter-toolkit web config YAML file (tls <file>).
 	tlsConfigPath string
+	// tlsConfig is built from inline Corefile args (tls <cert> <key> [ca] / client_auth).
+	tlsConfig *tls.Config
 }
 
 // New returns a new instance of Metrics with the given address.
@@ -141,12 +145,34 @@ func (m *Metrics) OnStartup() error {
 	}
 	m.srv = server
 
-	if m.tlsConfigPath == "" {
+	if m.tlsConfigPath == "" && m.tlsConfig == nil {
 		go func() {
 			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				log.Errorf("Failed to start HTTP metrics server: %s", err)
 			}
 		}()
+		ListenAddr = ln.Addr().String() // For tests.
+		return nil
+	}
+
+	// Serve HTTPS from an inline TLS config (tls <cert> <key> [ca] / client_auth).
+	if m.tlsConfig != nil {
+		tlsLn := tls.NewListener(startupListener, m.tlsConfig)
+		startUpErr := make(chan error, 1)
+		go func() {
+			if err := server.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
+				log.Errorf("Failed to start HTTPS metrics server: %v", err)
+				startUpErr <- err
+			}
+		}()
+
+		select {
+		case err := <-startUpErr:
+			return err
+		case <-startupListener.Ready():
+			log.Infof("Server is ready and accepting connections")
+		}
+
 		ListenAddr = ln.Addr().String() // For tests.
 		return nil
 	}

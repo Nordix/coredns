@@ -7,6 +7,11 @@ import (
 )
 
 func TestPrometheusParse(t *testing.T) {
+	if err := createTestCertFiles(t); err != nil {
+		t.Fatalf("Failed to create test cert files: %v", err)
+	}
+	defer cleanupTestCertFiles()
+
 	tests := []struct {
 		input     string
 		shouldErr bool
@@ -21,6 +26,14 @@ func TestPrometheusParse(t *testing.T) {
 		{`prometheus localhost:53 {
 			runtime_metrics
 		}`, false, "localhost:53"},
+		// tls inline cert/key and client_auth
+		{`prometheus localhost:53 {
+			tls test_data/server.crt test_data/server.key
+		}`, false, "localhost:53"},
+		{`prometheus localhost:53 {
+			tls test_data/server.crt test_data/server.key
+			client_auth NoClientCert
+		}`, false, "localhost:53"},
 		// fails
 		{`prometheus {}`, true, ""},
 		{`prometheus {
@@ -28,6 +41,13 @@ func TestPrometheusParse(t *testing.T) {
 		}`, true, ""},
 		{`prometheus /foo`, true, ""},
 		{`prometheus a b c`, true, ""},
+		{`prometheus localhost:53 {
+			client_auth NoClientCert
+		}`, true, ""},
+		{`prometheus localhost:53 {
+			tls test_data/server.crt test_data/server.key
+			client_auth Bogus
+		}`, true, ""},
 	}
 	for i, test := range tests {
 		c := caddy.NewTestController("dns", test.input)

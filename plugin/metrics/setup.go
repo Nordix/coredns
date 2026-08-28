@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"crypto/tls"
 	"net"
 	"runtime"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/coredns/coredns/coremain"
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/metrics/vars"
+	pkgtls "github.com/coredns/coredns/plugin/pkg/tls"
 	"github.com/coredns/coredns/plugin/pkg/uniq"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,6 +27,15 @@ var (
 	// swap persists across reloads until process restart.
 	runtimeMetricsOnce sync.Once
 )
+
+// clientAuthTypes maps the client_auth Corefile values to crypto/tls types.
+var clientAuthTypes = map[string]tls.ClientAuthType{
+	"NoClientCert":               tls.NoClientCert,
+	"RequestClientCert":          tls.RequestClientCert,
+	"RequireAnyClientCert":       tls.RequireAnyClientCert,
+	"VerifyClientCertIfGiven":    tls.VerifyClientCertIfGiven,
+	"RequireAndVerifyClientCert": tls.RequireAndVerifyClientCert,
+}
 
 func init() { plugin.Register("prometheus", setup) }
 
@@ -105,6 +116,10 @@ func parse(c *caddy.Controller) (*Metrics, error) {
 			return met, c.ArgErr()
 		}
 
+		var (
+			clientAuth    tls.ClientAuthType
+			clientAuthSet bool
+		)
 		for c.NextBlock() {
 			switch c.Val() {
 			case "runtime_metrics":
@@ -118,20 +133,49 @@ func parse(c *caddy.Controller) (*Metrics, error) {
 					))
 				})
 			case "tls":
-				if met.tlsConfigPath != "" {
-					return nil, c.Err("tls block already specified")
+				if met.tlsConfigPath != "" || met.tlsConfig != nil {
+					return nil, c.Err("tls already specified")
 				}
 
-				// Get cert and key files as positional arguments
+				args := c.RemainingArgs()
+				switch len(args) {
+				case 1:
+					// Single argument: exporter-toolkit web config YAML file.
+					met.tlsConfigPath = args[0]
+				case 2, 3:
+					// Inline cert, key and optional CA.
+					tlsConfig, err := pkgtls.NewTLSConfigFromArgs(args...)
+					if err != nil {
+						return nil, err
+					}
+					met.tlsConfig = tlsConfig
+				default:
+					return nil, c.ArgErr()
+				}
+			case "client_auth":
 				args := c.RemainingArgs()
 				if len(args) != 1 {
 					return nil, c.ArgErr()
 				}
-				tlsCfgPath := args[0]
-
-				met.tlsConfigPath = tlsCfgPath
+				authType, ok := clientAuthTypes[args[0]]
+				if !ok {
+					return nil, c.Errf("unknown client_auth type: %s", args[0])
+				}
+				clientAuth = authType
+				clientAuthSet = true
 			default:
 				return nil, c.Errf("unknown option: %s", c.Val())
+			}
+		}
+
+		if clientAuthSet {
+			if met.tlsConfig == nil {
+				return nil, c.Err("client_auth requires an inline tls cert and key")
+			}
+			met.tlsConfig.ClientAuth = clientAuth
+			// Reuse the configured CA (if any) to verify client certificates.
+			if met.tlsConfig.RootCAs != nil {
+				met.tlsConfig.ClientCAs = met.tlsConfig.RootCAs
 			}
 		}
 	}
